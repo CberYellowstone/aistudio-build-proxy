@@ -440,6 +440,24 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 设置通用的CORS响应头
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, x-goog-api-key")
+
+		// 如果是预检请求(OPTIONS)，直接返回204，不再继续处理
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		// 对于其他请求，继续处理
+		next.ServeHTTP(w, r)
+	})
+}
+
 func authMiddleware(next http.Handler, secretKey string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 如果密钥未设置，则跳过认证
@@ -813,9 +831,10 @@ func main() {
 	mux.HandleFunc(wsPath, handleWebSocket)
 	mux.Handle("/metrics", promhttp.Handler()) // Expose the registered metrics
 
-	// 构建中间件链: auth -> logging -> main handler
+	// 构建中间件链: cors -> logging -> auth -> main handler
 	proxyHandler := authMiddleware(http.HandlerFunc(handleProxyRequest), proxyAuthKey)
-	mux.Handle("/", loggingMiddleware(proxyHandler))
+	loggedHandler := loggingMiddleware(proxyHandler)
+	mux.Handle("/", corsMiddleware(loggedHandler))
 
 	server := &http.Server{
 		Addr:    proxyListenAddr,
