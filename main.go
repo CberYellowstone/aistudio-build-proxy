@@ -24,6 +24,7 @@ import (
 
 // --- Constants ---
 const (
+	clientIDKey         = contextKey("clientID")
 	wsPath              = "/v1/ws"
 	proxyListenAddr     = ":5345"
 	wsReadTimeout       = 90 * time.Second // 延长以适应服务端ping的间隔
@@ -41,6 +42,9 @@ var (
 	ErrNoAvailableClient = errors.New("no available client")
 )
 
+// --- Context Keys ---
+type contextKey string
+
 // --- Prometheus Metrics ---
 var (
 	activeConnections = promauto.NewGaugeVec(
@@ -55,7 +59,7 @@ var (
 			Name: "gpa_proxy_http_requests_total",
 			Help: "Total number of HTTP requests handled.",
 		},
-		[]string{"method", "path", "status"},
+		[]string{"method", "path", "status", "clientID"},
 	)
 	httpRequestDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -63,7 +67,7 @@ var (
 			Help:    "Histogram of HTTP request durations.",
 			Buckets: prometheus.DefBuckets,
 		},
-		[]string{"method", "path"},
+		[]string{"method", "path", "clientID"},
 	)
 )
 
@@ -383,13 +387,41 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		reqID := uuid.NewString()
-		// 将requestID注入到请求上下文中，以便后续处理器可以获取
+
+		// --- 认证与上下文注入 ---
+		// 将认证逻辑提前到中间件，以便获取clientID用于日志和指标
+		clientID, err := authenticateHTTPRequest(r)
+		if err != nil {
+			// 对于认证失败的请求，我们也希望记录下来
+			lrw := NewLoggingResponseWriter(w)
+			http.Error(lrw, "Proxy authentication failed: "+err.Error(), http.StatusUnauthorized)
+
+			log.Warn().
+				Str("type", "access_log").
+				Str("method", r.Method).
+				Str("path", r.URL.Path).
+				Str("remote_addr", r.RemoteAddr).
+				Int("status", lrw.statusCode).
+				Float64("duration_ms", float64(time.Since(start).Nanoseconds())/1e6).
+				Str("requestID", reqID).
+				Err(err).
+				Msg("Proxy authentication failed")
+
+			// 记录认证失败的指标
+			httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(lrw.statusCode), "unknown").Inc()
+			return
+		}
+
 		ctx := context.WithValue(r.Context(), "requestID", reqID)
+		ctx = context.WithValue(ctx, clientIDKey, clientID) // 将clientID注入上下文
 		r = r.WithContext(ctx)
 
+		// --- 执行下游处理器 ---
 		lrw := NewLoggingResponseWriter(w)
 		next.ServeHTTP(lrw, r)
 
+		// --- 记录访问日志和指标 ---
+		duration := time.Since(start)
 		log.Info().
 			Str("type", "access_log").
 			Str("method", r.Method).
@@ -397,27 +429,21 @@ func loggingMiddleware(next http.Handler) http.Handler {
 			Str("remote_addr", r.RemoteAddr).
 			Int("status", lrw.statusCode).
 			Int("size_bytes", lrw.size).
-			Float64("duration_ms", float64(time.Since(start).Nanoseconds())/1e6).
+			Float64("duration_ms", float64(duration.Nanoseconds())/1e6).
 			Str("requestID", reqID).
+			Str("clientID", clientID). // 在日志中也加入clientID
 			Msg("Handled HTTP request")
 
-		// Record metrics
-		duration := time.Since(start)
-		httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(lrw.statusCode)).Inc()
-		httpRequestDuration.WithLabelValues(r.Method, r.URL.Path).Observe(duration.Seconds())
+		httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(lrw.statusCode), clientID).Inc()
+		httpRequestDuration.WithLabelValues(r.Method, r.URL.Path, clientID).Observe(duration.Seconds())
 	})
 }
 
 func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	reqID, _ := r.Context().Value("requestID").(string)
-	hlog := log.With().Str("requestID", reqID).Logger()
+	clientID, _ := r.Context().Value(clientIDKey).(string) // 从上下文中获取clientID
+	hlog := log.With().Str("requestID", reqID).Str("clientID", clientID).Logger()
 
-	clientID, err := authenticateHTTPRequest(r)
-	if err != nil {
-		hlog.Warn().Err(err).Msg("Proxy authentication failed")
-		http.Error(w, "Proxy authentication failed: "+err.Error(), http.StatusUnauthorized)
-		return
-	}
 	respChan := make(chan *WSMessage, 10)
 	pendingRequests.Store(reqID, respChan)
 	defer pendingRequests.Delete(reqID)
