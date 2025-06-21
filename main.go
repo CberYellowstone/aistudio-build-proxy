@@ -508,7 +508,18 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 			return ErrConnectionLost
 
 		case <-ctx.Done():
-			// 超时处理
+			// 超时或客户端断开连接处理
+			// 在关闭响应之前，向浏览器客户端发送取消信令
+			cancelMessage := WSMessage{
+				ID:   requestID,
+				Type: "http_request_cancel",
+			}
+			if err := conn.safeWriteJSON(cancelMessage); err != nil {
+				log.Error().Err(err).Str("requestID", requestID).Msg("Failed to send cancel signal to client")
+			} else {
+				log.Info().Str("requestID", requestID).Msg("Sent cancel signal to client")
+			}
+
 			if !headersSet {
 				log.Error().Str("requestID", requestID).Dur("timeout", proxyRequestTimeout).Msg("Gateway Timeout - no response from client")
 				http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
