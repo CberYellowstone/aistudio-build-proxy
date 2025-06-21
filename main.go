@@ -317,8 +317,61 @@ func readPump(uc *UserConnection) {
 
 // --- 4. HTTP 反向代理与 WS 隧道 (含重试逻辑) ---
 
+// loggingResponseWriter is a wrapper around http.ResponseWriter to capture status code and response size
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	size       int
+}
+
+func NewLoggingResponseWriter(w http.ResponseWriter) *loggingResponseWriter {
+	return &loggingResponseWriter{w, http.StatusOK, 0}
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(code int) {
+	lrw.statusCode = code
+	lrw.ResponseWriter.WriteHeader(code)
+}
+
+func (lrw *loggingResponseWriter) Write(b []byte) (int, error) {
+	size, err := lrw.ResponseWriter.Write(b)
+	lrw.size += size
+	return size, err
+}
+
+// Flush a loggingResponseWriter to implement http.Flusher
+func (lrw *loggingResponseWriter) Flush() {
+	if flusher, ok := lrw.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		reqID := uuid.NewString()
+		// 将requestID注入到请求上下文中，以便后续处理器可以获取
+		ctx := context.WithValue(r.Context(), "requestID", reqID)
+		r = r.WithContext(ctx)
+
+		lrw := NewLoggingResponseWriter(w)
+		next.ServeHTTP(lrw, r)
+
+		log.Info().
+			Str("type", "access_log").
+			Str("method", r.Method).
+			Str("path", r.URL.Path).
+			Str("remote_addr", r.RemoteAddr).
+			Int("status", lrw.statusCode).
+			Int("size_bytes", lrw.size).
+			Float64("duration_ms", float64(time.Since(start).Nanoseconds())/1e6).
+			Str("requestID", reqID).
+			Msg("Handled HTTP request")
+	})
+}
+
 func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
-	reqID := uuid.NewString()
+	reqID, _ := r.Context().Value("requestID").(string)
 	hlog := log.With().Str("requestID", reqID).Logger()
 
 	clientID, err := authenticateHTTPRequest(r)
@@ -649,7 +702,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(wsPath, handleWebSocket)
-	mux.HandleFunc("/", handleProxyRequest)
+	mux.Handle("/", loggingMiddleware(http.HandlerFunc(handleProxyRequest)))
 
 	server := &http.Server{
 		Addr:    proxyListenAddr,
