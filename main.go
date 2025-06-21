@@ -8,12 +8,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
@@ -35,6 +39,32 @@ var (
 	ErrConnectionLost    = errors.New("websocket connection lost")
 	ErrConnectionTimeout = errors.New("request timeout")
 	ErrNoAvailableClient = errors.New("no available client")
+)
+
+// --- Prometheus Metrics ---
+var (
+	activeConnections = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "gpa_proxy_websocket_connections_active",
+			Help: "Number of currently active WebSocket connections.",
+		},
+		[]string{"clientID"},
+	)
+	httpRequestsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gpa_proxy_http_requests_total",
+			Help: "Total number of HTTP requests handled.",
+		},
+		[]string{"method", "path", "status"},
+	)
+	httpRequestDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "gpa_proxy_http_request_duration_seconds",
+			Help:    "Histogram of HTTP request durations.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "path"},
+	)
 )
 
 // --- 1. 连接管理与负载均衡 ---
@@ -121,6 +151,8 @@ func (p *ConnectionPool) AddConnection(clientID string, conn *websocket.Conn) *U
 		Str("connID", userConn.ConnID).
 		Int("totalConnections", len(clientConns.Connections)).
 		Msg("WebSocket client connected")
+
+	activeConnections.WithLabelValues(clientID).Inc()
 	return userConn
 }
 
@@ -155,6 +187,7 @@ func (p *ConnectionPool) RemoveConnection(clientID string, conn *websocket.Conn)
 	if len(clientConns.Connections) == 0 {
 		delete(p.Clients, clientID)
 		log.Info().Str("clientID", clientID).Msg("No connections left for client, removing client from pool")
+		activeConnections.DeleteLabelValues(clientID)
 	}
 }
 
@@ -367,6 +400,11 @@ func loggingMiddleware(next http.Handler) http.Handler {
 			Float64("duration_ms", float64(time.Since(start).Nanoseconds())/1e6).
 			Str("requestID", reqID).
 			Msg("Handled HTTP request")
+
+		// Record metrics
+		duration := time.Since(start)
+		httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(lrw.statusCode)).Inc()
+		httpRequestDuration.WithLabelValues(r.Method, r.URL.Path).Observe(duration.Seconds())
 	})
 }
 
@@ -702,6 +740,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(wsPath, handleWebSocket)
+	mux.Handle("/metrics", promhttp.Handler()) // Expose the registered metrics
 	mux.Handle("/", loggingMiddleware(http.HandlerFunc(handleProxyRequest)))
 
 	server := &http.Server{
