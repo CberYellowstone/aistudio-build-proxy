@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -26,12 +27,13 @@ const (
 	healthCheckInterval = 30 * time.Second
 	pingWriteTimeout    = 5 * time.Second
 	maxRequestRetries   = 3
+	maxFailedAttempts   = 3 // 超过3次失败则熔断
 )
 
 // --- Error Types ---
 var (
-	ErrConnectionLost     = errors.New("websocket connection lost")
-	ErrConnectionTimeout  = errors.New("request timeout")
+	ErrConnectionLost    = errors.New("websocket connection lost")
+	ErrConnectionTimeout = errors.New("request timeout")
 	ErrNoAvailableClient = errors.New("no available client")
 )
 
@@ -39,12 +41,15 @@ var (
 
 // UserConnection 存储单个WebSocket连接及其元数据
 type UserConnection struct {
-	Conn       *websocket.Conn
-	UserID     string
-	LastActive time.Time
-	writeMutex sync.Mutex // 保护对此单个连接的并发写入
-	Disconnect chan struct{} // 断开信号，关闭时广播给所有等待者
-	ConnID     string        // 连接唯一标识符，用于日志追踪
+	Conn           *websocket.Conn
+	ClientID       string // 用于区分不同浏览器实例的标识符
+	LastActive     time.Time
+	writeMutex     sync.Mutex    // 保护对此单个连接的并发写入
+	Disconnect     chan struct{} // 断开信号，关闭时广播给所有等待者
+	ConnID         string        // 连接唯一标识符，用于日志追踪
+	FailedAttempts int           // 连续失败次数
+	IsHealthy      bool          // 健康状态标志
+	LastFailure    time.Time     // 最后一次失败的时间戳
 }
 
 // safeWriteJSON 线程安全地向单个WebSocket连接写入JSON
@@ -58,7 +63,7 @@ func (uc *UserConnection) safeWriteJSON(v interface{}) error {
 func (uc *UserConnection) safeClose() {
 	uc.writeMutex.Lock()
 	defer uc.writeMutex.Unlock()
-	
+
 	select {
 	case <-uc.Disconnect:
 		// Channel已经关闭
@@ -67,107 +72,116 @@ func (uc *UserConnection) safeClose() {
 	}
 }
 
-// UserConnections 维护单个用户的所有连接和负载均衡状态
-type UserConnections struct {
+// ClientConnections 维护单个客户端的所有连接和负载均衡状态
+type ClientConnections struct {
 	sync.Mutex
 	Connections []*UserConnection
-	NextIndex   int // 用于轮询 (round-robin)
 }
 
 // ConnectionPool 全局连接池，并发安全
 type ConnectionPool struct {
 	sync.RWMutex
-	Users map[string]*UserConnections
+	Clients map[string]*ClientConnections
 }
 
 var globalPool = &ConnectionPool{
-	Users: make(map[string]*UserConnections),
+	Clients: make(map[string]*ClientConnections),
 }
 
 // AddConnection 将新连接添加到池中
-func (p *ConnectionPool) AddConnection(userID string, conn *websocket.Conn) *UserConnection {
+func (p *ConnectionPool) AddConnection(clientID string, conn *websocket.Conn) *UserConnection {
 	userConn := &UserConnection{
-		Conn:       conn,
-		UserID:     userID,
-		LastActive: time.Now(),
-		Disconnect: make(chan struct{}), // 初始化断开信号channel
-		ConnID:     uuid.New().String(), // 生成唯一连接ID
+		Conn:           conn,
+		ClientID:       clientID,
+		LastActive:     time.Now(),
+		Disconnect:     make(chan struct{}), // 初始化断开信号channel
+		ConnID:         uuid.New().String(), // 生成唯一连接ID
+		FailedAttempts: 0,                   // 初始化失败次数为0
+		IsHealthy:      true,                // 初始状态为健康
 	}
 
 	p.Lock()
 	defer p.Unlock()
 
-	userConns, exists := p.Users[userID]
+	clientConns, exists := p.Clients[clientID]
 	if !exists {
-		userConns = &UserConnections{
+		clientConns = &ClientConnections{
 			Connections: make([]*UserConnection, 0),
 		}
-		p.Users[userID] = userConns
+		p.Clients[clientID] = clientConns
 	}
 
-	userConns.Lock()
-	userConns.Connections = append(userConns.Connections, userConn)
-	userConns.Unlock()
+	clientConns.Lock()
+	clientConns.Connections = append(clientConns.Connections, userConn)
+	clientConns.Unlock()
 
-	log.Printf("WebSocket connected: UserID=%s, ConnID=%s, Total connections for user: %d",
-	           userID, userConn.ConnID, len(userConns.Connections))
+	log.Printf("WebSocket connected: ClientID=%s, ConnID=%s, Total connections for client: %d",
+		clientID, userConn.ConnID, len(clientConns.Connections))
 	return userConn
 }
 
 // RemoveConnection 从池中移除连接
-func (p *ConnectionPool) RemoveConnection(userID string, conn *websocket.Conn) {
+func (p *ConnectionPool) RemoveConnection(clientID string, conn *websocket.Conn) {
 	p.Lock()
 	defer p.Unlock()
 
-	userConns, exists := p.Users[userID]
+	clientConns, exists := p.Clients[clientID]
 	if !exists {
 		return
 	}
 
-	userConns.Lock()
-	defer userConns.Unlock()
+	clientConns.Lock()
+	defer clientConns.Unlock()
 
 	// 使用更高效的"交换并截断"方式删除元素
-	lastIdx := len(userConns.Connections) - 1
-	for i, uc := range userConns.Connections {
+	lastIdx := len(clientConns.Connections) - 1
+	for i, uc := range clientConns.Connections {
 		if uc.Conn == conn {
-			userConns.Connections[i] = userConns.Connections[lastIdx]
-			userConns.Connections = userConns.Connections[:lastIdx]
-			log.Printf("WebSocket disconnected: UserID=%s, ConnID=%s, Remaining connections for user: %d",
-			           userID, uc.ConnID, len(userConns.Connections))
+			clientConns.Connections[i] = clientConns.Connections[lastIdx]
+			clientConns.Connections = clientConns.Connections[:lastIdx]
+			log.Printf("WebSocket disconnected: ClientID=%s, ConnID=%s, Remaining connections for client: %d",
+				clientID, uc.ConnID, len(clientConns.Connections))
 			break
 		}
 	}
 
-	if len(userConns.Connections) == 0 {
-		delete(p.Users, userID)
-		log.Printf("No connections left for user %s, removing user from pool.", userID)
+	if len(clientConns.Connections) == 0 {
+		delete(p.Clients, clientID)
+		log.Printf("No connections left for client %s, removing client from pool.", clientID)
 	}
 }
 
-// GetConnection 使用轮询策略为用户选择一个连接
-func (p *ConnectionPool) GetConnection(userID string) (*UserConnection, error) {
+// GetConnection 使用基于健康状态的策略为客户端选择一个连接
+func (p *ConnectionPool) GetConnection(clientID string) (*UserConnection, error) {
 	p.RLock()
-	userConns, exists := p.Users[userID]
+	clientConns, exists := p.Clients[clientID]
 	p.RUnlock()
 
 	if !exists {
-		return nil, errors.New("no available client for this user")
+		return nil, ErrNoAvailableClient
 	}
 
-	userConns.Lock()
-	defer userConns.Unlock()
+	clientConns.Lock()
+	defer clientConns.Unlock()
 
-	numConns := len(userConns.Connections)
-	if numConns == 0 {
-		return nil, errors.New("no available client for this user")
+	var healthyConnections []*UserConnection
+	for _, uc := range clientConns.Connections {
+		if uc.IsHealthy {
+			healthyConnections = append(healthyConnections, uc)
+		}
 	}
 
-	idx := userConns.NextIndex % numConns
-	selectedConn := userConns.Connections[idx]
-	userConns.NextIndex = (userConns.NextIndex + 1) % numConns
+	if len(healthyConnections) == 0 {
+		return nil, ErrNoAvailableClient
+	}
 
-	return selectedConn, nil
+	// 找到失败次数最少的连接
+	sort.Slice(healthyConnections, func(i, j int) bool {
+		return healthyConnections[i].FailedAttempts < healthyConnections[j].FailedAttempts
+	})
+
+	bestConn := healthyConnections[0]
+	return bestConn, nil
 }
 
 // --- 2. WebSocket 消息结构 & 待处理请求 ---
@@ -191,11 +205,16 @@ var upgrader = websocket.Upgrader{
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	authToken := r.URL.Query().Get("auth_token")
-	userID, err := validateJWT(authToken)
-	if err != nil {
-		log.Printf("WebSocket authentication failed: %v", err)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	if authToken == "" {
+		log.Printf("WebSocket connection failed: missing auth_token")
+		http.Error(w, "Unauthorized: missing auth_token", http.StatusUnauthorized)
 		return
+	}
+
+	clientID := r.URL.Query().Get("client_id")
+	if clientID == "" {
+		clientID = "client-" + uuid.NewString()
+		log.Printf("WebSocket connection missing client_id, assigned a new one: %s", clientID)
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -204,7 +223,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userConn := globalPool.AddConnection(userID, conn)
+	userConn := globalPool.AddConnection(clientID, conn)
 	go readPump(userConn)
 }
 
@@ -212,9 +231,9 @@ func readPump(uc *UserConnection) {
 	defer func() {
 		// 关键：先发送断开信号，再清理连接
 		uc.safeClose() // 通知所有等待该连接的goroutine
-		globalPool.RemoveConnection(uc.UserID, uc.Conn)
+		globalPool.RemoveConnection(uc.ClientID, uc.Conn)
 		uc.Conn.Close()
-		log.Printf("readPump closed for user %s, ConnID %s", uc.UserID, uc.ConnID)
+		log.Printf("readPump closed for client %s, ConnID %s", uc.ClientID, uc.ConnID)
 	}()
 
 	uc.Conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
@@ -228,9 +247,9 @@ func readPump(uc *UserConnection) {
 		_, message, err := uc.Conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WebSocket read error for user %s: %v", uc.UserID, err)
+				log.Printf("WebSocket read error for client %s: %v", uc.ClientID, err)
 			} else {
-				log.Printf("WebSocket closed for user %s: %v", uc.UserID, err)
+				log.Printf("WebSocket closed for client %s: %v", uc.ClientID, err)
 			}
 			break
 		}
@@ -272,9 +291,9 @@ func readPump(uc *UserConnection) {
 // --- 4. HTTP 反向代理与 WS 隧道 (含重试逻辑) ---
 
 func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
-	userID, err := authenticateHTTPRequest(r)
+	clientID, err := authenticateHTTPRequest(r)
 	if err != nil {
-		http.Error(w, "Proxy authentication failed", http.StatusUnauthorized)
+		http.Error(w, "Proxy authentication failed: "+err.Error(), http.StatusUnauthorized)
 		return
 	}
 	reqID := uuid.NewString()
@@ -309,35 +328,42 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 
 	var selectedConn *UserConnection
 	var requestSent bool
-	
+
 	for i := 0; i < maxRequestRetries; i++ {
-		conn, err := globalPool.GetConnection(userID)
+		conn, err := globalPool.GetConnection(clientID)
 		if err != nil {
-			log.Printf("Attempt %d/%d: Error getting connection for user %s: %v", i+1, maxRequestRetries, userID, err)
+			log.Printf("Attempt %d/%d: Error getting connection for client %s: %v", i+1, maxRequestRetries, clientID, err)
 			if i == maxRequestRetries-1 { // 最后一次尝试失败
 				http.Error(w, "Service Unavailable: No active client connected", http.StatusServiceUnavailable)
 				return
 			}
+			time.Sleep(500 * time.Millisecond) // 等待一下再重试
 			continue
 		}
 
 		if err := conn.safeWriteJSON(requestPayload); err != nil {
-			log.Printf("Attempt %d/%d: Failed to send request over WebSocket to user %s, ConnID %s: %v. Removing connection and retrying.",
-			           i+1, maxRequestRetries, userID, conn.ConnID, err)
-			// 只移除连接，不在此处关闭。关闭操作由readPump的defer语句统一处理。
-			globalPool.RemoveConnection(userID, conn.Conn)
+			log.Printf("Attempt %d/%d: Failed to send request over WebSocket to client %s, ConnID %s: %v. Increasing failure count.",
+				i+1, maxRequestRetries, clientID, conn.ConnID, err)
+
+			conn.FailedAttempts++
+			conn.LastFailure = time.Now()
+			if conn.FailedAttempts >= maxFailedAttempts {
+				conn.IsHealthy = false
+				log.Printf("Circuit breaker triggered for ConnID %s. Marked as unhealthy.", conn.ConnID)
+			}
 			continue
 		}
 
+		conn.FailedAttempts = 0 // 请求成功，重置失败计数
 		selectedConn = conn
 		requestSent = true
-		log.Printf("Request %s sent successfully to user %s, ConnID %s on attempt %d/%d",
-		           reqID, userID, conn.ConnID, i+1, maxRequestRetries)
+		log.Printf("Request %s sent successfully to client %s, ConnID %s on attempt %d/%d",
+			reqID, clientID, conn.ConnID, i+1, maxRequestRetries)
 		break
 	}
 
 	if !requestSent {
-		log.Printf("Failed to send request %s for user %s after %d attempts.", reqID, userID, maxRequestRetries)
+		log.Printf("Failed to send request %s for client %s after %d attempts.", reqID, clientID, maxRequestRetries)
 		http.Error(w, "Bad Gateway: All available client connections failed", http.StatusBadGateway)
 		return
 	}
@@ -354,7 +380,7 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan chan *WSMessage,
-                            conn *UserConnection, requestID string) error {
+	conn *UserConnection, requestID string) error {
 	ctx, cancel := context.WithTimeout(r.Context(), proxyRequestTimeout)
 	defer cancel()
 
@@ -417,14 +443,21 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 			case "error":
 				if !headersSet {
 					errMsg := "Bad Gateway: Client reported an error"
-					if payloadErr, ok := msg.Payload["error"].(string); ok {
+					if details, ok := msg.Payload["details"].(string); ok && details != "" {
+						errMsg = details // 优先使用浏览器传来的详细错误
+					} else if payloadErr, ok := msg.Payload["error"].(string); ok {
 						errMsg = payloadErr
 					}
+
 					statusCode := http.StatusBadGateway
 					if code, ok := msg.Payload["status"].(float64); ok {
-						statusCode = int(code)
+						statusCode = int(code) // 使用浏览器传来的原始状态码
 					}
+
+					// 将原始的 Content-Type 等头信息也透传回去
+					setResponseHeaders(w, msg.Payload)
 					http.Error(w, errMsg, statusCode)
+
 				} else {
 					log.Printf("Error received from client after stream started: %v", msg.Payload)
 				}
@@ -437,7 +470,7 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 		case <-conn.Disconnect:
 			// 连接断开信号
 			log.Printf("Request %s: WebSocket connection %s (ConnID: %s) lost during processing",
-			           requestID, conn.UserID, conn.ConnID)
+				requestID, conn.ClientID, conn.ConnID)
 			if !headersSet {
 				// 还没发送响应头，可以返回错误状态码
 				http.Error(w, "Bad Gateway: WebSocket connection lost", http.StatusBadGateway)
@@ -451,11 +484,11 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 			// 超时处理
 			if !headersSet {
 				log.Printf("Request %s: Gateway Timeout - no response from client after %v",
-				           requestID, proxyRequestTimeout)
+					requestID, proxyRequestTimeout)
 				http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
 			} else {
 				log.Printf("Request %s: Gateway Timeout - stream incomplete after %v",
-				           requestID, proxyRequestTimeout)
+					requestID, proxyRequestTimeout)
 			}
 			return ErrConnectionTimeout
 		}
@@ -474,16 +507,25 @@ func startHealthChecker(pool *ConnectionPool, interval time.Duration) {
 		var connectionsToRemove []*UserConnection
 
 		pool.RLock()
-		for _, userConns := range pool.Users {
+		for _, userConns := range pool.Clients {
 			userConns.Lock()
 			for _, uc := range userConns.Connections {
 				if err := uc.Conn.SetWriteDeadline(time.Now().Add(pingWriteTimeout)); err != nil {
 					connectionsToRemove = append(connectionsToRemove, uc)
 					continue
 				}
+
 				if err := uc.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 					connectionsToRemove = append(connectionsToRemove, uc)
+				} else {
+					// Ping成功，检查是否可以恢复健康状态
+					if !uc.IsHealthy {
+						uc.IsHealthy = true
+						uc.FailedAttempts = 0
+						log.Printf("Connection %s passed health check and is now marked as healthy.", uc.ConnID)
+					}
 				}
+
 				uc.Conn.SetWriteDeadline(time.Time{})
 			}
 			userConns.Unlock()
@@ -493,10 +535,10 @@ func startHealthChecker(pool *ConnectionPool, interval time.Duration) {
 		if len(connectionsToRemove) > 0 {
 			log.Printf("Health checker found %d dead connections to remove.", len(connectionsToRemove))
 			for _, uc := range connectionsToRemove {
-				log.Printf("Health checker removing dead connection: User %s, ConnID %s",
-				           uc.UserID, uc.ConnID)
+				log.Printf("Health checker removing dead connection: Client %s, ConnID %s",
+					uc.ClientID, uc.ConnID)
 				uc.safeClose() // 确保断开信号被发送
-				pool.RemoveConnection(uc.UserID, uc.Conn)
+				pool.RemoveConnection(uc.ClientID, uc.Conn)
 			}
 		}
 	}
@@ -543,18 +585,24 @@ func writeBody(w http.ResponseWriter, payload map[string]interface{}) {
 	}
 }
 
-func validateJWT(token string) (string, error) {
-	if token == "" {
-		return "", errors.New("missing auth_token")
-	}
-	// 在此简化模型中，任何非空令牌都被视为有效，并映射到同一个用户 "user-1"
-	// 允许多个浏览器/标签页为同一个“用户”提供连接
-	return "user-1", nil
-}
-
 func authenticateHTTPRequest(r *http.Request) (string, error) {
-	// 代理请求也映射到同一个用户
-	return "user-1", nil
+	// 为HTTP请求选择一个可用的客户端ID
+	// 这是一个简化策略：如果只有一个客户端，就用它。如果有多个，就返回一个错误，提示需要更明确的路由规则。
+	// 在更复杂的系统中，可以基于请求头或路径来选择客户端。
+	globalPool.RLock()
+	defer globalPool.RUnlock()
+
+	if len(globalPool.Clients) == 0 {
+		return "", ErrNoAvailableClient
+	}
+
+	// 简单起见，我们只取第一个客户端
+	// 注意：map的迭代顺序是不保证的，所以这实际上是随机选择了一个
+	for clientID := range globalPool.Clients {
+		return clientID, nil
+	}
+
+	return "", errors.New("could not determine a client to route to")
 }
 
 // --- 主函数 (含优雅退出) ---
