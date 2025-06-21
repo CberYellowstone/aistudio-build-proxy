@@ -5,17 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"sort"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 // --- Constants ---
@@ -76,6 +76,7 @@ func (uc *UserConnection) safeClose() {
 type ClientConnections struct {
 	sync.Mutex
 	Connections []*UserConnection
+	NextIndex   int // 用于在同级健康的连接中实现轮询
 }
 
 // ConnectionPool 全局连接池，并发安全
@@ -115,8 +116,11 @@ func (p *ConnectionPool) AddConnection(clientID string, conn *websocket.Conn) *U
 	clientConns.Connections = append(clientConns.Connections, userConn)
 	clientConns.Unlock()
 
-	log.Printf("WebSocket connected: ClientID=%s, ConnID=%s, Total connections for client: %d",
-		clientID, userConn.ConnID, len(clientConns.Connections))
+	log.Info().
+		Str("clientID", clientID).
+		Str("connID", userConn.ConnID).
+		Int("totalConnections", len(clientConns.Connections)).
+		Msg("WebSocket client connected")
 	return userConn
 }
 
@@ -139,19 +143,22 @@ func (p *ConnectionPool) RemoveConnection(clientID string, conn *websocket.Conn)
 		if uc.Conn == conn {
 			clientConns.Connections[i] = clientConns.Connections[lastIdx]
 			clientConns.Connections = clientConns.Connections[:lastIdx]
-			log.Printf("WebSocket disconnected: ClientID=%s, ConnID=%s, Remaining connections for client: %d",
-				clientID, uc.ConnID, len(clientConns.Connections))
+			log.Info().
+				Str("clientID", clientID).
+				Str("connID", uc.ConnID).
+				Int("remainingConnections", len(clientConns.Connections)).
+				Msg("WebSocket client disconnected")
 			break
 		}
 	}
 
 	if len(clientConns.Connections) == 0 {
 		delete(p.Clients, clientID)
-		log.Printf("No connections left for client %s, removing client from pool.", clientID)
+		log.Info().Str("clientID", clientID).Msg("No connections left for client, removing client from pool")
 	}
 }
 
-// GetConnection 使用基于健康状态的策略为客户端选择一个连接
+// GetConnection 使用分级轮询策略为客户端选择一个连接
 func (p *ConnectionPool) GetConnection(clientID string) (*UserConnection, error) {
 	p.RLock()
 	clientConns, exists := p.Clients[clientID]
@@ -175,13 +182,33 @@ func (p *ConnectionPool) GetConnection(clientID string) (*UserConnection, error)
 		return nil, ErrNoAvailableClient
 	}
 
-	// 找到失败次数最少的连接
-	sort.Slice(healthyConnections, func(i, j int) bool {
-		return healthyConnections[i].FailedAttempts < healthyConnections[j].FailedAttempts
-	})
+	// 1. 找到最小的失败次数
+	minFails := -1
+	for _, uc := range healthyConnections {
+		if minFails == -1 || uc.FailedAttempts < minFails {
+			minFails = uc.FailedAttempts
+		}
+	}
 
-	bestConn := healthyConnections[0]
-	return bestConn, nil
+	// 2. 构建最佳候选池
+	var bestCandidates []*UserConnection
+	for _, uc := range healthyConnections {
+		if uc.FailedAttempts == minFails {
+			bestCandidates = append(bestCandidates, uc)
+		}
+	}
+
+	// 3. 在最佳候选池中进行轮询
+	if len(bestCandidates) == 0 {
+		// 理论上不应该发生，因为 healthyConnections 不为空
+		return nil, ErrNoAvailableClient
+	}
+
+	idx := clientConns.NextIndex % len(bestCandidates)
+	selectedConn := bestCandidates[idx]
+	clientConns.NextIndex = (clientConns.NextIndex + 1) % len(bestCandidates)
+
+	return selectedConn, nil
 }
 
 // --- 2. WebSocket 消息结构 & 待处理请求 ---
@@ -206,7 +233,7 @@ var upgrader = websocket.Upgrader{
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	authToken := r.URL.Query().Get("auth_token")
 	if authToken == "" {
-		log.Printf("WebSocket connection failed: missing auth_token")
+		log.Warn().Msg("WebSocket connection failed: missing auth_token")
 		http.Error(w, "Unauthorized: missing auth_token", http.StatusUnauthorized)
 		return
 	}
@@ -214,12 +241,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	clientID := r.URL.Query().Get("client_id")
 	if clientID == "" {
 		clientID = "client-" + uuid.NewString()
-		log.Printf("WebSocket connection missing client_id, assigned a new one: %s", clientID)
+		log.Warn().Str("assignedClientID", clientID).Msg("WebSocket connection missing client_id, assigned a new one")
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Failed to upgrade to WebSocket: %v", err)
+		log.Error().Err(err).Msg("Failed to upgrade to WebSocket")
 		return
 	}
 
@@ -233,7 +260,7 @@ func readPump(uc *UserConnection) {
 		uc.safeClose() // 通知所有等待该连接的goroutine
 		globalPool.RemoveConnection(uc.ClientID, uc.Conn)
 		uc.Conn.Close()
-		log.Printf("readPump closed for client %s, ConnID %s", uc.ClientID, uc.ConnID)
+		log.Info().Str("clientID", uc.ClientID).Str("connID", uc.ConnID).Msg("readPump closed for client")
 	}()
 
 	uc.Conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
@@ -247,9 +274,9 @@ func readPump(uc *UserConnection) {
 		_, message, err := uc.Conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WebSocket read error for client %s: %v", uc.ClientID, err)
+				log.Warn().Err(err).Str("clientID", uc.ClientID).Msg("WebSocket read error")
 			} else {
-				log.Printf("WebSocket closed for client %s: %v", uc.ClientID, err)
+				log.Info().Err(err).Str("clientID", uc.ClientID).Msg("WebSocket closed")
 			}
 			break
 		}
@@ -260,7 +287,7 @@ func readPump(uc *UserConnection) {
 
 		var msg WSMessage
 		if err := json.Unmarshal(message, &msg); err != nil {
-			log.Printf("Error unmarshalling WebSocket message: %v", err)
+			log.Error().Err(err).Msg("Error unmarshalling WebSocket message")
 			continue
 		}
 
@@ -268,7 +295,7 @@ func readPump(uc *UserConnection) {
 		case "ping":
 			err := uc.safeWriteJSON(map[string]string{"type": "pong", "id": msg.ID})
 			if err != nil {
-				log.Printf("Error sending pong: %v", err)
+				log.Error().Err(err).Str("clientID", uc.ClientID).Msg("Error sending pong")
 				return
 			}
 		case "http_response", "stream_start", "stream_chunk", "stream_end", "error":
@@ -277,13 +304,13 @@ func readPump(uc *UserConnection) {
 				select {
 				case respChan <- &msg:
 				default:
-					log.Printf("Warning: Response channel full for request ID %s, dropping message type %s", msg.ID, msg.Type)
+					log.Warn().Str("requestID", msg.ID).Str("msgType", msg.Type).Msg("Response channel full, dropping message")
 				}
 			} else {
-				log.Printf("Received response for unknown or timed-out request ID: %s", msg.ID)
+				log.Warn().Str("requestID", msg.ID).Msg("Received response for unknown or timed-out request")
 			}
 		default:
-			log.Printf("Received unknown message type from client: %s", msg.Type)
+			log.Warn().Str("msgType", msg.Type).Str("clientID", uc.ClientID).Msg("Received unknown message type from client")
 		}
 	}
 }
@@ -291,12 +318,15 @@ func readPump(uc *UserConnection) {
 // --- 4. HTTP 反向代理与 WS 隧道 (含重试逻辑) ---
 
 func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
+	reqID := uuid.NewString()
+	hlog := log.With().Str("requestID", reqID).Logger()
+
 	clientID, err := authenticateHTTPRequest(r)
 	if err != nil {
+		hlog.Warn().Err(err).Msg("Proxy authentication failed")
 		http.Error(w, "Proxy authentication failed: "+err.Error(), http.StatusUnauthorized)
 		return
 	}
-	reqID := uuid.NewString()
 	respChan := make(chan *WSMessage, 10)
 	pendingRequests.Store(reqID, respChan)
 	defer pendingRequests.Delete(reqID)
@@ -332,7 +362,7 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	for i := 0; i < maxRequestRetries; i++ {
 		conn, err := globalPool.GetConnection(clientID)
 		if err != nil {
-			log.Printf("Attempt %d/%d: Error getting connection for client %s: %v", i+1, maxRequestRetries, clientID, err)
+			hlog.Warn().Err(err).Int("attempt", i+1).Str("clientID", clientID).Msg("Error getting connection for client")
 			if i == maxRequestRetries-1 { // 最后一次尝试失败
 				http.Error(w, "Service Unavailable: No active client connected", http.StatusServiceUnavailable)
 				return
@@ -342,14 +372,13 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err := conn.safeWriteJSON(requestPayload); err != nil {
-			log.Printf("Attempt %d/%d: Failed to send request over WebSocket to client %s, ConnID %s: %v. Increasing failure count.",
-				i+1, maxRequestRetries, clientID, conn.ConnID, err)
+			hlog.Error().Err(err).Int("attempt", i+1).Str("clientID", clientID).Str("connID", conn.ConnID).Msg("Failed to send request over WebSocket, increasing failure count")
 
 			conn.FailedAttempts++
 			conn.LastFailure = time.Now()
 			if conn.FailedAttempts >= maxFailedAttempts {
 				conn.IsHealthy = false
-				log.Printf("Circuit breaker triggered for ConnID %s. Marked as unhealthy.", conn.ConnID)
+				hlog.Warn().Str("connID", conn.ConnID).Msg("Circuit breaker triggered. Marked as unhealthy")
 			}
 			continue
 		}
@@ -357,13 +386,12 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 		conn.FailedAttempts = 0 // 请求成功，重置失败计数
 		selectedConn = conn
 		requestSent = true
-		log.Printf("Request %s sent successfully to client %s, ConnID %s on attempt %d/%d",
-			reqID, clientID, conn.ConnID, i+1, maxRequestRetries)
+		hlog.Info().Str("clientID", clientID).Str("connID", conn.ConnID).Int("attempt", i+1).Msg("Request sent successfully")
 		break
 	}
 
 	if !requestSent {
-		log.Printf("Failed to send request %s for client %s after %d attempts.", reqID, clientID, maxRequestRetries)
+		hlog.Error().Str("clientID", clientID).Int("attempts", maxRequestRetries).Msg("Failed to send request after multiple attempts")
 		http.Error(w, "Bad Gateway: All available client connections failed", http.StatusBadGateway)
 		return
 	}
@@ -372,7 +400,7 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	if err := processWebSocketResponse(w, r, respChan, selectedConn, reqID); err != nil {
 		// 处理特定错误类型
 		if errors.Is(err, ErrConnectionLost) {
-			log.Printf("Request %s: Connection %s lost during processing", reqID, selectedConn.ConnID)
+			log.Warn().Str("requestID", reqID).Str("connID", selectedConn.ConnID).Msg("Connection lost during processing")
 			// 连接丢失错误已在processWebSocketResponse中处理HTTP响应
 		}
 		// 其他错误已在processWebSocketResponse中处理
@@ -386,7 +414,7 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		log.Println("Warning: ResponseWriter does not support flushing, streaming will be buffered.")
+		log.Warn().Str("requestID", requestID).Msg("ResponseWriter does not support flushing, streaming will be buffered")
 	}
 
 	headersSet := false
@@ -403,7 +431,7 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 			switch msg.Type {
 			case "http_response":
 				if headersSet {
-					log.Println("Received http_response after headers were already set. Ignoring.")
+					log.Warn().Str("requestID", requestID).Msg("Received http_response after headers were already set. Ignoring.")
 					return nil
 				}
 				setResponseHeaders(w, msg.Payload)
@@ -413,7 +441,7 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 
 			case "stream_start":
 				if headersSet {
-					log.Println("Received stream_start after headers were already set. Ignoring.")
+					log.Warn().Str("requestID", requestID).Msg("Received stream_start after headers were already set. Ignoring.")
 					continue
 				}
 				setResponseHeaders(w, msg.Payload)
@@ -425,7 +453,7 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 
 			case "stream_chunk":
 				if !headersSet {
-					log.Println("Warning: Received stream_chunk before stream_start. Using default 200 OK.")
+					log.Warn().Str("requestID", requestID).Msg("Received stream_chunk before stream_start. Using default 200 OK.")
 					w.WriteHeader(http.StatusOK)
 					headersSet = true
 				}
@@ -459,36 +487,33 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 					http.Error(w, errMsg, statusCode)
 
 				} else {
-					log.Printf("Error received from client after stream started: %v", msg.Payload)
+					log.Error().Str("requestID", requestID).Interface("payload", msg.Payload).Msg("Error received from client after stream started")
 				}
 				return nil
 
 			default:
-				log.Printf("Received unexpected message type %s while waiting for response", msg.Type)
+				log.Error().Str("requestID", requestID).Str("msgType", msg.Type).Msg("Received unexpected message type while waiting for response")
 			}
 
 		case <-conn.Disconnect:
 			// 连接断开信号
-			log.Printf("Request %s: WebSocket connection %s (ConnID: %s) lost during processing",
-				requestID, conn.ClientID, conn.ConnID)
+			log.Warn().Str("requestID", requestID).Str("clientID", conn.ClientID).Str("connID", conn.ConnID).Msg("WebSocket connection lost during processing")
 			if !headersSet {
 				// 还没发送响应头，可以返回错误状态码
 				http.Error(w, "Bad Gateway: WebSocket connection lost", http.StatusBadGateway)
 			} else {
 				// 已经开始发送响应，记录日志但无法改变HTTP状态
-				log.Printf("Request %s: Stream interrupted due to connection loss", requestID)
+				log.Warn().Str("requestID", requestID).Msg("Stream interrupted due to connection loss")
 			}
 			return ErrConnectionLost
 
 		case <-ctx.Done():
 			// 超时处理
 			if !headersSet {
-				log.Printf("Request %s: Gateway Timeout - no response from client after %v",
-					requestID, proxyRequestTimeout)
+				log.Error().Str("requestID", requestID).Dur("timeout", proxyRequestTimeout).Msg("Gateway Timeout - no response from client")
 				http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
 			} else {
-				log.Printf("Request %s: Gateway Timeout - stream incomplete after %v",
-					requestID, proxyRequestTimeout)
+				log.Error().Str("requestID", requestID).Dur("timeout", proxyRequestTimeout).Msg("Gateway Timeout - stream incomplete")
 			}
 			return ErrConnectionTimeout
 		}
@@ -501,7 +526,7 @@ func startHealthChecker(pool *ConnectionPool, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	log.Println("Proactive health checker started.")
+	log.Info().Dur("interval", interval).Msg("Proactive health checker started")
 
 	for range ticker.C {
 		var connectionsToRemove []*UserConnection
@@ -522,7 +547,7 @@ func startHealthChecker(pool *ConnectionPool, interval time.Duration) {
 					if !uc.IsHealthy {
 						uc.IsHealthy = true
 						uc.FailedAttempts = 0
-						log.Printf("Connection %s passed health check and is now marked as healthy.", uc.ConnID)
+						log.Info().Str("connID", uc.ConnID).Str("clientID", uc.ClientID).Msg("Connection passed health check and is now marked as healthy")
 					}
 				}
 
@@ -533,10 +558,9 @@ func startHealthChecker(pool *ConnectionPool, interval time.Duration) {
 		pool.RUnlock()
 
 		if len(connectionsToRemove) > 0 {
-			log.Printf("Health checker found %d dead connections to remove.", len(connectionsToRemove))
+			log.Warn().Int("count", len(connectionsToRemove)).Msg("Health checker found dead connections to remove")
 			for _, uc := range connectionsToRemove {
-				log.Printf("Health checker removing dead connection: Client %s, ConnID %s",
-					uc.ClientID, uc.ConnID)
+				log.Info().Str("clientID", uc.ClientID).Str("connID", uc.ConnID).Msg("Health checker removing dead connection")
 				uc.safeClose() // 确保断开信号被发送
 				pool.RemoveConnection(uc.ClientID, uc.Conn)
 			}
@@ -608,6 +632,10 @@ func authenticateHTTPRequest(r *http.Request) (string, error) {
 // --- 主函数 (含优雅退出) ---
 
 func main() {
+	// zerolog时间戳默认是Unix时间格式，改为更易读的格式
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
+
 	mux := http.NewServeMux()
 	mux.HandleFunc(wsPath, handleWebSocket)
 	mux.HandleFunc("/", handleProxyRequest)
@@ -620,25 +648,25 @@ func main() {
 	go startHealthChecker(globalPool, healthCheckInterval)
 
 	go func() {
-		log.Printf("Starting server on %s", server.Addr)
-		log.Printf("WebSocket endpoint available at ws://%s%s", server.Addr, wsPath)
-		log.Printf("HTTP proxy available at http://%s/", server.Addr)
+		log.Info().Str("address", server.Addr).Msg("Starting server")
+		log.Info().Str("ws_endpoint", wsPath).Msg("WebSocket endpoint available")
+		log.Info().Str("http_proxy", "/").Msg("HTTP proxy available")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Could not start server: %s\n", err)
+			log.Fatal().Err(err).Msg("Could not start server")
 		}
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("Shutdown signal received, starting graceful shutdown...")
+	log.Info().Msg("Shutdown signal received, starting graceful shutdown...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("Server forced to shutdown: %v", err)
+		log.Fatal().Err(err).Msg("Server forced to shutdown")
 	}
 
-	log.Println("Server exiting gracefully")
+	log.Info().Msg("Server exiting gracefully")
 }
