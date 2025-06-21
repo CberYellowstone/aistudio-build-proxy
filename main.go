@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -439,6 +440,43 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func authMiddleware(next http.Handler, secretKey string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 如果密钥未设置，则跳过认证
+		if secretKey == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// 优先级 1: 检查 "Authorization: Bearer <key>"
+		if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+			if token := strings.TrimPrefix(authHeader, "Bearer "); token == secretKey {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		// 优先级 2: 检查 "x-goog-api-key: <key>"
+		if apiKeyHeader := r.Header.Get("x-goog-api-key"); apiKeyHeader != "" {
+			if apiKeyHeader == secretKey {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		// 优先级 3: 检查 URL "?key=<key>"
+		if queryKey := r.URL.Query().Get("key"); queryKey != "" {
+			if queryKey == secretKey {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		// 所有方式都失败
+		http.Error(w, "Unauthorized: Missing or invalid API key.", http.StatusUnauthorized)
+	})
+}
+
 func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	reqID, _ := r.Context().Value("requestID").(string)
 	clientID, _ := r.Context().Value(clientIDKey).(string) // 从上下文中获取clientID
@@ -764,10 +802,20 @@ func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
 
+	proxyAuthKey := os.Getenv("PROXY_AUTH_KEY")
+	if proxyAuthKey != "" {
+		log.Info().Msg("Proxy authentication ENABLED.")
+	} else {
+		log.Info().Msg("Proxy authentication DISABLED.")
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc(wsPath, handleWebSocket)
 	mux.Handle("/metrics", promhttp.Handler()) // Expose the registered metrics
-	mux.Handle("/", loggingMiddleware(http.HandlerFunc(handleProxyRequest)))
+
+	// 构建中间件链: auth -> logging -> main handler
+	proxyHandler := authMiddleware(http.HandlerFunc(handleProxyRequest), proxyAuthKey)
+	mux.Handle("/", loggingMiddleware(proxyHandler))
 
 	server := &http.Server{
 		Addr:    proxyListenAddr,
