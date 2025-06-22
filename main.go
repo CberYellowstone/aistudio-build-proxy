@@ -48,6 +48,14 @@ var (
 // --- Context Keys ---
 type contextKey string
 
+const requestStateKey = contextKey("requestState")
+
+// --- Shared Request State ---
+// Used to pass state between middleware handlers.
+type requestState struct {
+	ClientID string
+}
+
 // --- Prometheus Metrics ---
 var (
 	activeConnections = promauto.NewGaugeVec(
@@ -326,7 +334,11 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		reqID := uuid.NewString()
+
+		// Create a shared state for this request
+		state := &requestState{ClientID: "unknown"}
 		ctx := context.WithValue(r.Context(), "requestID", reqID)
+		ctx = context.WithValue(ctx, requestStateKey, state)
 		r = r.WithContext(ctx)
 
 		log.Info().Str("type", "access_start").Str("method", r.Method).Str("path", r.URL.Path).Str("remote_addr", r.RemoteAddr).Str("requestID", reqID).Msg("Received new HTTP request")
@@ -335,10 +347,8 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(lrw, r)
 
 		duration := time.Since(start)
-		clientID, _ := r.Context().Value(clientIDKey).(string)
-		if clientID == "" {
-			clientID = "unknown"
-		}
+		// ClientID is now read from the shared state, which may have been updated by inner middleware.
+		clientID := state.ClientID
 
 		log.Info().
 			Str("type", "access_finish").
@@ -396,6 +406,8 @@ func authMiddleware(next http.Handler, secretKey string) http.Handler {
 func clientSelectionMiddleware(next func(http.ResponseWriter, *http.Request) error) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID, _ := r.Context().Value("requestID").(string)
+		state, _ := r.Context().Value(requestStateKey).(*requestState)
+
 		clientList := globalPool.getClientList()
 		if len(clientList) == 0 {
 			http.Error(w, "Service Unavailable: No active client connected", http.StatusServiceUnavailable)
@@ -406,10 +418,13 @@ func clientSelectionMiddleware(next func(http.ResponseWriter, *http.Request) err
 		var lastErr error
 		for i := 0; i < len(clientList); i++ {
 			clientID := clientList[(startIdx+uint32(i))%uint32(len(clientList))]
-			ctx := context.WithValue(r.Context(), clientIDKey, clientID)
-			reqWithClient := r.WithContext(ctx)
 
-			err := next(w, reqWithClient)
+			// Update the shared state instead of creating a new context for the logger to see.
+			if state != nil {
+				state.ClientID = clientID
+			}
+			// The original request 'r' is passed down, as its context now contains all necessary info.
+			err := next(w, r)
 
 			if err == nil {
 				return // Success
@@ -433,7 +448,8 @@ func clientSelectionMiddleware(next func(http.ResponseWriter, *http.Request) err
 
 func handleProxyRequest(w http.ResponseWriter, r *http.Request) error {
 	reqID, _ := r.Context().Value("requestID").(string)
-	clientID, _ := r.Context().Value(clientIDKey).(string)
+	state, _ := r.Context().Value(requestStateKey).(*requestState)
+	clientID := state.ClientID // Get clientID from the shared state
 
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
