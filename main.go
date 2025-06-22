@@ -27,13 +27,14 @@ import (
 
 // --- Constants ---
 const (
-	clientIDKey         = contextKey("clientID")
-	wsPath              = "/v1/ws"
-	proxyListenAddr     = ":5345"
-	wsReadTimeout       = 90 * time.Second
-	proxyRequestTimeout = 600 * time.Second
-	healthCheckInterval = 30 * time.Second
-	pingWriteTimeout    = 5 * time.Second
+	clientIDKey           = contextKey("clientID")
+	wsPath                = "/v1/ws"
+	proxyListenAddr       = ":5345"
+	wsReadTimeout         = 65 * time.Second
+	proxyRequestTimeout   = 600 * time.Second
+	healthCheckInterval   = 30 * time.Second
+	healthCheckReqTimeout = 15 * time.Second
+	initialRespTimeout    = 20 * time.Second
 )
 
 // --- Error Types ---
@@ -43,6 +44,8 @@ var (
 	ErrNoAvailableClient  = errors.New("no available client")
 	ErrClientUnhealthy    = errors.New("client connection is currently unhealthy")
 	ErrRequestWriteFailed = errors.New("failed to write request to client websocket")
+	ErrRateLimited        = errors.New("client is rate limited")
+	ErrInitialTimeout     = errors.New("client initial response timeout")
 )
 
 // --- Context Keys ---
@@ -271,10 +274,6 @@ func readPump(uc *UserConnection) {
 	}()
 
 	uc.Conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
-	uc.Conn.SetPongHandler(func(string) error {
-		uc.Conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
-		return nil
-	})
 
 	for {
 		_, message, err := uc.Conn.ReadMessage()
@@ -283,6 +282,8 @@ func readPump(uc *UserConnection) {
 			break
 		}
 		uc.LastActive = time.Now()
+		// Reset read deadline on any received message (application-layer heartbeat)
+		uc.Conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 		var msg WSMessage
 		if err := json.Unmarshal(message, &msg); err != nil {
 			log.Error().Err(err).Msg("Error unmarshalling WebSocket message")
@@ -295,7 +296,10 @@ func readPump(uc *UserConnection) {
 			if ch, ok := pendingRequests.Load(msg.ID); ok {
 				ch.(chan *WSMessage) <- &msg
 			} else {
-				log.Warn().Str("requestID", msg.ID).Msg("Received response for unknown or timed-out request")
+				// Suppress warnings for timed-out health checks to avoid log spam.
+				if !strings.HasPrefix(msg.ID, "healthcheck-") {
+					log.Warn().Str("requestID", msg.ID).Msg("Received response for unknown or timed-out request")
+				}
 			}
 		}
 	}
@@ -403,10 +407,18 @@ func authMiddleware(next http.Handler, secretKey string) http.Handler {
 
 // --- 4. Core Proxy Logic ---
 
-func clientSelectionMiddleware(next func(http.ResponseWriter, *http.Request) error) http.Handler {
+func clientSelectionMiddleware(next func(http.ResponseWriter, *http.Request, []byte) error) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID, _ := r.Context().Value("requestID").(string)
 		state, _ := r.Context().Value(requestStateKey).(*requestState)
+
+		// Read the body ONCE before the retry loop.
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+			return
+		}
+		defer r.Body.Close()
 
 		clientList := globalPool.getClientList()
 		if len(clientList) == 0 {
@@ -423,16 +435,27 @@ func clientSelectionMiddleware(next func(http.ResponseWriter, *http.Request) err
 			if state != nil {
 				state.ClientID = clientID
 			}
-			// The original request 'r' is passed down, as its context now contains all necessary info.
-			err := next(w, r)
+
+			// Pass the pre-read body to the handler.
+			err := next(w, r, bodyBytes)
 
 			if err == nil {
 				return // Success
 			}
 
 			lastErr = err
-			if errors.Is(err, ErrRequestWriteFailed) {
+			// Check for retryable errors. These are errors that are safe to retry on another client
+			// without causing side effects.
+			if errors.Is(err, ErrRequestWriteFailed) || errors.Is(err, ErrClientUnhealthy) || errors.Is(err, ErrRateLimited) || errors.Is(err, ErrInitialTimeout) {
 				log.Warn().Err(err).Str("requestID", reqID).Str("clientID", clientID).Msg("Request attempt failed, transferring to next client.")
+				// Mark client as unhealthy immediately upon failure
+				if clientConns, exists := globalPool.Clients[clientID]; exists {
+					clientConns.Lock()
+					if clientConns.Connection != nil {
+						markAsUnhealthy(clientConns.Connection, "request_fail", err)
+					}
+					clientConns.Unlock()
+				}
 				continue // Retry with next client
 			} else {
 				// Non-retryable error, break the loop and return the error
@@ -446,16 +469,10 @@ func clientSelectionMiddleware(next func(http.ResponseWriter, *http.Request) err
 	})
 }
 
-func handleProxyRequest(w http.ResponseWriter, r *http.Request) error {
+func handleProxyRequest(w http.ResponseWriter, r *http.Request, bodyBytes []byte) error {
 	reqID, _ := r.Context().Value("requestID").(string)
 	state, _ := r.Context().Value(requestStateKey).(*requestState)
 	clientID := state.ClientID // Get clientID from the shared state
-
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
-		return nil // Non-retryable
-	}
 
 	headers := make(map[string][]string)
 	for k, v := range r.Header {
@@ -500,6 +517,8 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 	defer cancel()
 	flusher, _ := w.(http.Flusher)
 	headersSet := false
+	initialTimeout := time.NewTimer(initialRespTimeout)
+	defer initialTimeout.Stop()
 
 	for {
 		select {
@@ -510,6 +529,10 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 				}
 				return nil
 			}
+
+			// Stop the initial timer as soon as we get any valid message for this request
+			initialTimeout.Stop()
+
 			switch msg.Type {
 			case "http_response":
 				if !headersSet {
@@ -543,67 +566,165 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 				}
 				return nil
 			case "error":
+				statusCode := http.StatusBadGateway
+				if code, ok := msg.Payload["status"].(float64); ok {
+					statusCode = int(code)
+				}
+
+				if statusCode == http.StatusTooManyRequests {
+					return ErrRateLimited // This is a retryable error
+				}
+
 				if !headersSet {
 					errMsg := "Bad Gateway: Client reported an error"
 					if details, ok := msg.Payload["details"].(string); ok {
 						errMsg = details
 					}
-					statusCode := http.StatusBadGateway
-					if code, ok := msg.Payload["status"].(float64); ok {
-						statusCode = int(code)
-					}
 					setResponseHeaders(w, msg.Payload)
 					http.Error(w, errMsg, statusCode)
 				}
-				return nil
+				return nil // This is a final, non-retryable error
 			}
 		case <-conn.Disconnect:
-			if !headersSet {
-				http.Error(w, "Bad Gateway: WebSocket connection lost", http.StatusBadGateway)
-			}
+			// Do not write to the response here. Let the middleware handle the retry.
 			return ErrConnectionLost
 		case <-ctx.Done():
 			if err := conn.safeWriteJSON(WSMessage{ID: requestID, Type: "http_request_cancel"}); err != nil {
 				log.Error().Err(err).Str("requestID", requestID).Msg("Failed to send cancel signal")
 			}
-			if !headersSet {
-				http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
-			}
+			// Do not write to the response here. Let the middleware handle the retry.
 			return ErrConnectionTimeout
+		case <-initialTimeout.C:
+			// Do not write to the response here. Let the middleware handle the retry.
+			return ErrInitialTimeout
 		}
 	}
 }
 
 // --- 5. Health Checking ---
 
+func forceHealthCheck(pool *ConnectionPool) {
+	pool.RLock()
+	clientIDs := make([]string, 0, len(pool.Clients))
+	for id := range pool.Clients {
+		clientIDs = append(clientIDs, id)
+	}
+	pool.RUnlock()
+
+	var wg sync.WaitGroup
+	for _, clientID := range clientIDs {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			checkClientHealth(pool, id)
+		}(clientID)
+	}
+	wg.Wait()
+}
+
+func handleForceHealthCheck(w http.ResponseWriter, r *http.Request) {
+	log.Info().Msg("Manual health check triggered via API.")
+	forceHealthCheck(globalPool)
+
+	statusReport := make(map[string]bool)
+	globalPool.RLock()
+	for id, clientConns := range globalPool.Clients {
+		clientConns.Lock()
+		if clientConns.Connection != nil {
+			statusReport[id] = clientConns.Connection.IsHealthy
+		} else {
+			statusReport[id] = false
+		}
+		clientConns.Unlock()
+	}
+	globalPool.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(statusReport); err != nil {
+		log.Error().Err(err).Msg("Failed to write health check status response.")
+		http.Error(w, "Failed to encode status report", http.StatusInternalServerError)
+	}
+}
+
 func startHealthChecker(pool *ConnectionPool, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
-		pool.RLock()
-		for _, clientConns := range pool.Clients {
-			clientConns.Lock()
-			if uc := clientConns.Connection; uc != nil {
-				if err := uc.Conn.SetWriteDeadline(time.Now().Add(pingWriteTimeout)); err != nil {
-					uc.IsHealthy = false
-				} else if err := uc.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					if uc.IsHealthy {
-						log.Warn().Err(err).Str("connID", uc.ConnID).Msg("Health check ping failed, marking as unhealthy.")
-					}
-					uc.IsHealthy = false
-					uc.FailedAttempts++
-					uc.LastFailure = time.Now()
-				} else if !uc.IsHealthy {
-					uc.IsHealthy = true
-					uc.FailedAttempts = 0
-					log.Info().Str("connID", uc.ConnID).Str("clientID", uc.ClientID).Msg("Connection passed health check and is now marked as healthy")
-				}
-				_ = uc.Conn.SetWriteDeadline(time.Time{})
-			}
-			clientConns.Unlock()
-		}
-		pool.RUnlock()
+		forceHealthCheck(pool)
 	}
+}
+
+func checkClientHealth(pool *ConnectionPool, clientID string) {
+	clientConns, exists := pool.Clients[clientID]
+	if !exists {
+		return
+	}
+	clientConns.Lock()
+	uc := clientConns.Connection
+	clientConns.Unlock()
+
+	if uc == nil {
+		return
+	}
+
+	healthCheckID := "healthcheck-" + uuid.NewString()
+	requestPayload := WSMessage{
+		ID:   healthCheckID,
+		Type: "http_request",
+		Payload: map[string]interface{}{
+			"method": "GET",
+			"url":    "https://generativelanguage.googleapis.com/v1beta/models?key=GEMINI_API_KEY&pageSize=1",
+		},
+	}
+
+	respChan := make(chan *WSMessage, 10)
+	pendingRequests.Store(healthCheckID, respChan)
+	defer pendingRequests.Delete(healthCheckID)
+
+	if err := uc.safeWriteJSON(requestPayload); err != nil {
+		markAsUnhealthy(uc, "write_failure", err)
+		return
+	}
+
+	select {
+	case msg := <-respChan:
+		// End-to-end health check: a client is healthy only if it can get a 200 OK response from the upstream.
+		// This handles both regular and streaming responses, as the client implementation
+		// is expected to include the status in the 'stream_start' message as well.
+		if msg.Type == "http_response" || msg.Type == "stream_start" {
+			if status, ok := msg.Payload["status"].(float64); ok && int(status) == http.StatusOK {
+				markAsHealthy(uc)
+			} else {
+				// Received a response, but it's not 200 OK.
+				markAsUnhealthy(uc, "bad_status", errors.New("health check returned non-200 status"))
+			}
+		} else {
+			// Received an unexpected response type (e.g., 'error', 'stream_chunk').
+			errMsg := "unexpected response type for health check: " + msg.Type
+			markAsUnhealthy(uc, "bad_response_type", errors.New(errMsg))
+		}
+	case <-time.After(healthCheckReqTimeout):
+		markAsUnhealthy(uc, "timeout", errors.New("health check request timed out"))
+	case <-uc.Disconnect:
+		// Connection already closed, no need to mark as unhealthy
+	}
+}
+
+func markAsUnhealthy(uc *UserConnection, reason string, err error) {
+	if uc.IsHealthy {
+		log.Warn().Err(err).Str("clientID", uc.ClientID).Str("reason", reason).Msg("Health check failed, marking as unhealthy.")
+	}
+	uc.IsHealthy = false
+	uc.FailedAttempts++
+	uc.LastFailure = time.Now()
+}
+
+func markAsHealthy(uc *UserConnection) {
+	if !uc.IsHealthy {
+		log.Info().Str("clientID", uc.ClientID).Msg("Connection passed health check and is now marked as healthy.")
+	}
+	uc.IsHealthy = true
+	uc.FailedAttempts = 0
 }
 
 // --- Helper Functions ---
@@ -660,6 +781,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc(wsPath, handleWebSocket)
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/healthcheck", handleForceHealthCheck)
 
 	selectionHandler := clientSelectionMiddleware(handleProxyRequest)
 	authedHandler := authMiddleware(selectionHandler, proxyAuthKey)
