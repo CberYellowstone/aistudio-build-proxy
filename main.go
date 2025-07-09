@@ -32,9 +32,9 @@ const (
 	proxyListenAddr       = ":5345"
 	wsReadTimeout         = 65 * time.Second
 	proxyRequestTimeout   = 600 * time.Second
-	healthCheckInterval   = 30 * time.Second
+	healthCheckInterval   = 60 * time.Second
 	healthCheckReqTimeout = 15 * time.Second
-	initialRespTimeout    = 20 * time.Second
+	initialRespTimeout    = 60 * time.Second
 )
 
 // --- Error Types ---
